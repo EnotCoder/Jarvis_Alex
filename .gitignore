@@ -1,0 +1,34 @@
+# Модели и окружение — это гигабайты, их нельзя в репозиторий.
+# Инструкция по скачиванию: bash fetch-models.sh и bash setup.sh
+
+# Модели (~2.6 ГБ)
+models/
+
+# Python-окружение (201 МБ)
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Логи серверов
+logs/
+*.log
+
+# Заметки — личное
+notes.md
+
+# Снимки экрана
+*.png
+!docs/*.png
+
+# Временное
+*.wav
+*.part
+.cache/
+
+# Прочее
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
