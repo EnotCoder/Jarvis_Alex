@@ -66,16 +66,17 @@ def say(hud: HUD, text: str, voice: str = VOICE) -> None:
         hud.line("не удалось синтезировать речь", C_RED)
 
 
-def preflight(hud: HUD) -> bool:
+def preflight(hud: HUD, need_mic: bool = True) -> bool:
     """Проверяет всё до старта, чтобы не падать посреди разговора."""
     ok = True
 
-    mic = audio.pick_source()
-    if not mic:
+    # В режиме проверки файла микрофон не нужен: аудио уже лежит на диске.
+    mic = audio.pick_source() if need_mic else None
+    if need_mic and not mic:
         hud.show("error", "микрофон не найден")
         print(f"{C_RED}Микрофон не найден.{C_OFF} Проверь USB и PulseAudio/PipeWire.")
         ok = False
-    else:
+    elif mic:
         hud.line(f"микрофон: {mic.split('.')[-2] if '.' in mic else mic}")
 
     if not stt.available():
@@ -124,7 +125,7 @@ def main() -> int:
     print(f"{C_CYAN}║{C_OFF}  JARVIS v0.1 — локальная версия       {C_CYAN}║{C_OFF}")
     print(f"{C_CYAN}╚══════════════════════════════════════════╝{C_OFF}\n")
 
-    if not preflight(hud):
+    if not preflight(hud, need_mic="--file" not in sys.argv):
         return 1
 
     if not llm.start_server():

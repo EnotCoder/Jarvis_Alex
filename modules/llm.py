@@ -12,14 +12,22 @@ from pathlib import Path
 from . import tools
 
 ROOT = Path(__file__).resolve().parent.parent
-MODEL = ROOT / "models" / "qwen2.5-3b-instruct-q4_k_m.gguf"
 PERSONA = ROOT / "config" / "persona.md"
 
 HOST = "127.0.0.1"
 PORT = 8099
 BASE = f"http://{HOST}:{PORT}"
 N_CTX = 4096
-GPU_LAYERS = 99          # выгрузить всё в VRAM (6 ГБ хватает для 3B Q4)
+GPU_LAYERS = 99          # выгрузить всё в VRAM (6 ГБ хватает для 8B в Q4)
+PARALLEL = 1             # один диалог за раз: при 4 слотах KV-кэш съедал бы VRAM
+
+# Предпочтительный порядок: сначала 8B, если он скачан, иначе 3B.
+MODEL_NAMES = ["qwen3-8b-q4_k_m.gguf", "qwen2.5-3b-instruct-q4_k_m.gguf"]
+
+# Qwen3 по умолчанию рассуждает вслух: заполняет reasoning_content,
+# а в content отдаёт пустоту. Для голосового ответа это не годится,
+# поэтому режим размышления выключается явно.
+NO_THINK = {"enable_thinking": False}
 
 SYSTEM = """{persona}
 
@@ -28,6 +36,10 @@ SYSTEM = """{persona}
 
 У тебя есть инструменты для действий. Правила:
 - Стоит выполнить действие — вызывай инструмент, не описывай его словами.
+- Никогда не говори «записал», «открыл», «поставил», если инструмент не вызывался.
+  Не вызвал — значит не сделал. На это модель попалась: фраза распозналась мутно,
+  инструмент не вызвался, а ответ был «Заметка записана». Лучше честно сказать
+  «не понял, что именно записать».
 - На «выключи» и «перезагрузи» сначала спроси подтверждение. Только после явного
   согласия вызывай инструмент снова с confirm=true.
 - Результат действия уже вернётся тебе текстом. Не выдумывай, что сделал, чего не делал.
@@ -41,9 +53,11 @@ _server: subprocess.Popen | None = None
 
 
 def _model_path() -> Path | None:
-    """Берём любую GGUF, если дефолтная не скачалась."""
-    if MODEL.exists():
-        return MODEL
+    """Берёт первую доступную модель из MODEL_NAMES."""
+    for name in MODEL_NAMES:
+        path = ROOT / "models" / name
+        if path.exists():
+            return path
     models = sorted((ROOT / "models").glob("*.gguf"))
     return models[0] if models else None
 
@@ -74,6 +88,7 @@ def start_server(wait: float = 90.0) -> bool:
         "--host", HOST,
         "--port", str(PORT),
         "-c", str(N_CTX),
+        "-np", str(PARALLEL),
         "-ngl", str(GPU_LAYERS),
         "--no-webui",
     ]
@@ -138,6 +153,7 @@ def chat(messages: list[dict], temperature: float = 0.7,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": False,
+        "chat_template_kwargs": NO_THINK,
     }
     if use_tools:
         payload["tools"] = tools.SCHEMAS
@@ -151,10 +167,14 @@ def chat(messages: list[dict], temperature: float = 0.7,
             return "", done
 
         message = data["choices"][0]["message"]
+        # На случай если модель всё-таки включила размышление
+        text = (message.get("content") or "").strip()
+        if not text and message.get("reasoning_content"):
+            text = message["reasoning_content"].strip()
         calls = message.get("tool_calls")
 
         if not calls:
-            return (message.get("content") or "").strip(), done
+            return text, done
 
         payload["messages"].append({
             "role": "assistant",
@@ -180,4 +200,4 @@ def chat(messages: list[dict], temperature: float = 0.7,
                 "content": result,
             })
 
-    return (message.get("content") or "").strip() or "Готово.", done
+    return text or "Готово.", done
