@@ -24,6 +24,12 @@ FRAME_MS = 30         # размер фрейма для VAD
 SENSITIVITY = 2.5
 MIN_RMS = 180.0
 
+# Пауза, после которой реплика считается законченной.
+# Подобрана перебором в tests/sweep_silence.py: 0.7 с рвал фразу на паузе
+# внутри реплики, 1.1 с не рвёт ни разу и стоит +0.39 с отклика.
+# Это размен «ждать дольше» на «не терять конец фразы».
+VAD_SILENCE = 1.1
+
 # После того как Джарвис договорил, его голос ещё долго гуляет по комнате.
 # Без этой защиты микрофон ловит сам себя и ассистент начинает отвечать себе.
 ECHO_GUARD = 3.0        # секунд после озвучки
@@ -71,10 +77,87 @@ def pick_source(prefer: str | None = None) -> str | None:
     return pool[0][1] if pool else None
 
 
+class Endpoint:
+    """Решает, когда речь началась и когда закончилась.
+
+    Вынесено отдельно от захвата, чтобы логику можно было проверять на
+    готовых записях: тесты скармливают ей уровни из файла и смотрят, где
+    она обрезала фразу.
+
+    Это энергетический порог от измеренного фона. Он дешёвый, но режет фразу
+    на любой паузе длиннее silence_for — поэтому в `modules/turn.py` лежит
+    нейросетевая замена, а этот класс остаётся запасным вариантом.
+    """
+
+    IDLE = "idle"
+    SPEAKING = "speaking"
+
+    def __init__(self, sensitivity: float = SENSITIVITY, min_rms: float = MIN_RMS,
+                 silence_for: float = VAD_SILENCE, min_speech: float = 0.55):
+        self.sensitivity = sensitivity
+        self.min_rms = min_rms
+        self.silence_for = silence_for
+        self.min_speech = min_speech
+        self.noise_floor = 120.0
+        self.guard_until = 0.0
+        self.state = self.IDLE
+        self.spoken = 0.0
+        self.silence_run = 0.0
+        self.level = 0.0
+
+    def set_noise_floor(self, value: float) -> None:
+        self.noise_floor = max(float(value), 10.0)
+
+    def set_guard(self, seconds: float = ECHO_GUARD) -> None:
+        self.guard_until = time.monotonic() + seconds
+
+    def threshold(self, now: float | None = None) -> float:
+        t = max(self.noise_floor * self.sensitivity, self.min_rms)
+        if now is not None and now < self.guard_until:
+            t *= ECHO_MULTIPLIER
+        return t
+
+    def reset(self) -> None:
+        self.state = self.IDLE
+        self.spoken = 0.0
+        self.silence_run = 0.0
+
+    def feed(self, rms: float, dt: float = FRAME_MS / 1000,
+             now: float | None = None) -> str:
+        """Обрабатывает фрейм. Возвращает "start", "end" или "".
+
+        Фон подстраивается сам, но только пока идёт ожидание: во время речи
+        обучаться нельзя, иначе громкая фраза станет новой нормой.
+        """
+        self.level = rms
+        thr = self.threshold(now)
+
+        if self.state == self.IDLE:
+            if rms < thr:
+                self.noise_floor += (rms - self.noise_floor) * 0.05
+                return ""
+            self.state = self.SPEAKING
+            self.spoken = 0.0
+            self.silence_run = 0.0
+            return "start"
+
+        self.spoken += dt
+        if rms < thr * 0.6:
+            self.silence_run += dt
+        else:
+            self.silence_run = 0.0
+
+        if self.silence_run >= self.silence_for and self.spoken >= self.min_speech:
+            self.reset()
+            return "end"
+        return ""
+
+
 class MicStream:
     """Непрерывный захват с микрофона, отдаёт фреймы через очередь."""
 
-    def __init__(self, source: str, vad_silence: float = 0.7, vad_min_speech: float = 0.55):
+    def __init__(self, source: str, vad_silence: float = VAD_SILENCE,
+                 vad_min_speech: float = 0.55):
         # vad_min_speech: короче 0.55 с Whisper начинает додумывать —
         # на обрывках вроде «клок» он уверенно выдаёт целые слова.
         self.source = source
@@ -83,8 +166,7 @@ class MicStream:
         self._proc: subprocess.Popen | None = None
         self._q: queue.Queue[np.ndarray] = queue.Queue()
         self._rms: queue.Queue[float] = queue.Queue()
-        self._noise_floor = 120.0
-        self._guard_until = 0.0
+        self.endpoint = Endpoint(silence_for=vad_silence, min_speech=vad_min_speech)
         self.speaking = threading.Event()
 
     def set_guard(self, seconds: float = ECHO_GUARD) -> None:
@@ -156,14 +238,17 @@ class MicStream:
             levels.append(level)
 
         if not levels:
-            return self._noise_floor
+            return self.endpoint.noise_floor
         # Медиана, а не среднее: один щелчок мыши не должен задирать порог
-        self._noise_floor = max(float(np.median(levels)), 10.0)
-        return self._noise_floor
+        self.endpoint.set_noise_floor(float(np.median(levels)))
+        return self.endpoint.noise_floor
+
+    def set_guard(self, seconds: float = ECHO_GUARD) -> None:
+        """Поднимает порог на время после озвучки — защита от самослуха."""
+        self.endpoint.set_guard(seconds)
 
     def _threshold(self) -> float:
-        """Порог речи: и над фоном, и не ниже абсолютного минимума."""
-        return max(self._noise_floor * SENSITIVITY, MIN_RMS)
+        return self.endpoint.threshold(time.monotonic())
 
     def read_utterance(self, on_level=None, timeout: float = 15.0) -> np.ndarray | None:
         """Ждёт начало речи и собирает фразу целиком.
@@ -172,9 +257,10 @@ class MicStream:
         """
         started = False
         chunks: list[np.ndarray] = []
-        silence_run = 0.0
-        spoken = 0.0
         waited = 0.0
+        spoken = 0.0
+
+        self.endpoint.reset()
 
         while waited < timeout:
             try:
@@ -186,28 +272,19 @@ class MicStream:
                 continue
 
             waited += FRAME_MS / 1000
-            rms = self._rms.get_nowait()
-            threshold = self._threshold()
-            if time.monotonic() < self._guard_until:
-                threshold *= ECHO_MULTIPLIER
+            event = self.endpoint.feed(self._rms.get_nowait())
 
-            if not started:
-                # Фон плавно подстраивается под комнату, но только в тишине
-                if rms < threshold:
-                    self._noise_floor += (rms - self._noise_floor) * 0.05
-                if rms > threshold:
-                    started = True
-                    self.speaking.set()
-            else:
-                spoken += FRAME_MS / 1000
-                silence_run = silence_run + FRAME_MS / 1000 if rms < threshold * 0.6 else 0.0
+            if event == "start":
+                started = True
+                self.speaking.set()
+            elif event == "end":
+                break
 
             if started:
+                spoken += FRAME_MS / 1000
                 chunks.append(samples)
                 if on_level:
-                    on_level(min(rms / 4000.0, 1.0))
-                if silence_run >= self.silence_for and spoken >= self.min_speech:
-                    break
+                    on_level(min(self.endpoint.level / 4000.0, 1.0))
 
         self.speaking.clear()
         if not chunks or spoken < self.min_speech:
