@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
+# добавляет папку с jarvis.py в начало списка путей поиска модулей
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from modules import audio, llm, stt, tools, tts
@@ -30,11 +31,11 @@ C_YEL = "\033[33m"
 C_RED = "\033[31m"
 C_OFF = "\033[0m"
 
-HISTORY_LIMIT = 12          # пар реплик в памяти
+HISTORY_LIMIT = 12
 
 
 class HUD:
-    """Минималистичный индикатор состояния в терминале."""
+    # Минималистичный индикатор состояния в терминале.
 
     def __init__(self):
         self.state = "boot"
